@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import com.cliplink.core.AppState
 import com.cliplink.core.ClipDirection
 import com.cliplink.core.ClipItem
+import com.cliplink.core.ClipboardContent
 import com.cliplink.core.DeviceKind
 import com.cliplink.core.PeerDevice
 import java.time.Instant
@@ -79,7 +80,7 @@ import java.time.format.DateTimeFormatter
 
 data class ClipLinkActions(
     val sendCurrent: () -> Unit,
-    val copy: (String) -> Unit,
+    val copy: (ClipboardContent) -> Unit,
     val deleteHistory: (String) -> Unit,
     val clearHistory: () -> Unit,
     val setAutoSend: (Boolean) -> Unit,
@@ -203,12 +204,12 @@ private fun SyncPage(state: AppState, actions: ClipLinkActions) {
             }
         }
         item {
-            SectionTitle("当前剪贴板", "只同步文本，单条上限 1 MB")
+            SectionTitle("当前剪贴板", "自动同步文本、富文本、图片和文件，单次上限 32 MB")
             Card(shape = RoundedCornerShape(22.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(20.dp)) {
                     Text(
-                        state.currentClipboard.ifBlank { "剪贴板中还没有文本" },
-                        color = if (state.currentClipboard.isBlank()) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+                        state.currentClipboard?.summary() ?: "剪贴板中还没有可同步内容",
+                        color = if (state.currentClipboard == null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
                         maxLines = 6,
                         overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.bodyLarge,
@@ -216,19 +217,19 @@ private fun SyncPage(state: AppState, actions: ClipLinkActions) {
                     Spacer(Modifier.height(18.dp))
                     Button(
                         onClick = actions.sendCurrent,
-                        enabled = state.currentClipboard.isNotBlank(),
+                        enabled = state.currentClipboard != null,
                         modifier = Modifier.fillMaxWidth().height(50.dp),
                         shape = RoundedCornerShape(15.dp),
                     ) {
                         Icon(Icons.AutoMirrored.Rounded.Send, null)
                         Spacer(Modifier.width(9.dp))
-                        Text("发送当前剪贴板")
+                        Text("立即同步当前剪贴板")
                     }
                 }
             }
         }
         item {
-            SectionTitle("附近设备", "同一 Wi‑Fi 且配对码一致时自动出现")
+            SectionTitle("附近设备", "同一局域网且配对码一致时自动出现")
             if (state.peers.isEmpty()) EmptyDevices() else Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 state.peers.forEach { DeviceRow(it) }
             }
@@ -326,7 +327,7 @@ private fun HistoryPage(state: AppState, actions: ClipLinkActions) {
 
 @Composable
 private fun HistoryRow(item: ClipItem, actions: ClipLinkActions) {
-    Card(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth().clickable { actions.copy(item.text) }) {
+    Card(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth().clickable { actions.copy(item.content) }) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 AssistChip(
@@ -339,7 +340,7 @@ private fun HistoryRow(item: ClipItem, actions: ClipLinkActions) {
                 Text(formatTime(item.timestamp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
                 IconButton(onClick = { actions.deleteHistory(item.id) }) { Icon(Icons.Rounded.DeleteOutline, "删除") }
             }
-            Text(item.text, maxLines = 4, overflow = TextOverflow.Ellipsis)
+            Text(item.content.summary(), maxLines = 4, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -356,7 +357,7 @@ private fun SettingsPage(state: AppState, actions: ClipLinkActions) {
         item { SectionTitle("同步偏好", "更改后立即生效") }
         item {
             SettingsCard {
-                ToggleRow("自动发送", "本机剪贴板变化时自动发送", state.autoSend, actions.setAutoSend)
+                ToggleRow("自动发送", "连接后补发当前内容，之后有变化即自动发送", state.autoSend, actions.setAutoSend)
                 HorizontalDivider()
                 ToggleRow("自动接收", "收到内容后写入本机剪贴板", state.autoReceive, actions.setAutoReceive)
             }
@@ -420,7 +421,7 @@ private fun SettingsPage(state: AppState, actions: ClipLinkActions) {
                     Text("Android 提示", fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Android 10 及以上会限制后台读取剪贴板。手机端在前台时可自动发送；不在前台时请打开 ClipLink 后点击“发送当前剪贴板”。",
+                        "支持文本、富文本、图片及文件（最多 32 个、合计 32 MB）。Android 10 及以上会限制后台读取剪贴板；手机端在前台时可自动同步，不在前台时请打开 ClipLink。",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }

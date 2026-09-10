@@ -18,7 +18,11 @@ class ManualConnectionTest {
         val peersA = CountDownLatch(1)
         val peersB = CountDownLatch(1)
         val received = CountDownLatch(1)
-        var receivedText = ""
+        val sentContent = ClipboardContent(
+            ClipboardKind.FILES,
+            files = listOf(ClipboardFile("sample.bin", "application/octet-stream", ByteArray(16_384) { (it % 251).toByte() })),
+        )
+        var receivedFingerprint = ""
 
         val serviceA = LanSyncService(
             LanSyncService.Config("desktop-a", "电脑", DeviceKind.DESKTOP, "TEST-CODE-1234", discoveryA, portA),
@@ -29,7 +33,7 @@ class ManualConnectionTest {
             object : LanSyncService.Listener {
                 override fun onPeersChanged(peers: List<PeerDevice>) { if (peers.isNotEmpty()) peersB.countDown() }
                 override fun onMessage(message: ClipMessage) {
-                    receivedText = message.text
+                    receivedFingerprint = message.content?.fingerprint().orEmpty()
                     received.countDown()
                 }
                 override fun onStatus(message: String) = Unit
@@ -44,9 +48,9 @@ class ManualConnectionTest {
             assertTrue(peersA.await(5, TimeUnit.SECONDS), "发起端未收到握手确认")
             assertTrue(peersB.await(5, TimeUnit.SECONDS), "接收端未登记手动设备")
 
-            assertEquals(1, serviceA.broadcastText("manual link works"))
+            assertEquals(1, serviceA.broadcast(sentContent))
             assertTrue(received.await(5, TimeUnit.SECONDS), "加密剪贴板消息未送达")
-            assertEquals("manual link works", receivedText)
+            assertEquals(sentContent.fingerprint(), receivedFingerprint)
         } finally {
             serviceA.close()
             serviceB.close()

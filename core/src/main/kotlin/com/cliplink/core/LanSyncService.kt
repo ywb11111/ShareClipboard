@@ -85,14 +85,14 @@ class LanSyncService(
         return true
     }
 
-    fun broadcastText(text: String): Int {
-        if (!running.get() || text.isBlank()) return 0
+    fun broadcast(content: ClipboardContent): Int {
+        if (!running.get() || content.isEmpty()) return 0
         val message = ClipMessage(
             id = UUID.randomUUID().toString(),
             originDeviceId = config.deviceId,
             originDeviceName = config.deviceName,
             timestamp = System.currentTimeMillis(),
-            text = text,
+            content = content,
             originPort = config.transferPort,
         )
         val encrypted = try {
@@ -130,7 +130,7 @@ class LanSyncService(
     private fun receive(socket: Socket) {
         socket.use { client ->
             try {
-                client.soTimeout = 5_000
+                client.soTimeout = 30_000
                 val input = DataInputStream(client.getInputStream())
                 val message = readMessage(input)
                 if (handleIncoming(message, client.inetAddress.hostAddress) && message.kind == MessageKind.HELLO) {
@@ -156,7 +156,7 @@ class LanSyncService(
         return try {
             Socket().use { socket ->
                 socket.connect(InetSocketAddress(endpoint.device.address, endpoint.port), 2_500)
-                socket.soTimeout = 5_000
+                socket.soTimeout = 30_000
                 writeFrame(DataOutputStream(socket.getOutputStream()), encrypted)
                 if (expectResponses) {
                     val input = DataInputStream(socket.getInputStream())
@@ -194,7 +194,7 @@ class LanSyncService(
         trimSeenMessages()
         registerInboundPeer(message, address)
         when (message.kind) {
-            MessageKind.CLIPBOARD -> if (message.text.isNotEmpty()) listener.onMessage(message)
+            MessageKind.CLIPBOARD -> if (message.content?.isEmpty() == false) listener.onMessage(message)
             MessageKind.HELLO -> Unit
             MessageKind.HELLO_ACK -> listener.onStatus("已通过 IP 连接 ${message.originDeviceName}")
         }
@@ -334,7 +334,7 @@ class LanSyncService(
             originDeviceId = config.deviceId,
             originDeviceName = config.deviceName,
             timestamp = System.currentTimeMillis(),
-            text = "",
+            content = null,
             kind = kind,
             originPort = config.transferPort,
         )

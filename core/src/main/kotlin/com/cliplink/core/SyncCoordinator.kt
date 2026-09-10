@@ -3,6 +3,7 @@ package com.cliplink.core
 import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 
 class SyncCoordinator(
     private val clipboard: ClipboardPort,
@@ -11,10 +12,14 @@ class SyncCoordinator(
     private val deviceKind: DeviceKind,
 ) : AutoCloseable {
     private val observers = CopyOnWriteArrayList<(AppState) -> Unit>()
+    private val clipboardExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "cliplink-content").apply { isDaemon = true }
+    }
     private val deviceId = settings.get(KEY_DEVICE_ID) ?: UUID.randomUUID().toString().also {
         settings.put(KEY_DEVICE_ID, it)
     }
     @Volatile private var service: LanSyncService? = null
+    @Volatile private var lastPeerIds = emptySet<String>()
     private val storedPairingCode = settings.get(KEY_PAIRING_CODE)
         ?.takeIf { it.length >= 8 }
         ?: generatePairingCode().also { settings.put(KEY_PAIRING_CODE, it) }
@@ -29,7 +34,7 @@ class SyncCoordinator(
         clipboard.startWatching(::onLocalClipboardChanged)
         update {
             it.copy(
-                currentClipboard = clipboard.readText().orEmpty(),
+                currentClipboard = clipboard.readContent(),
                 localAddresses = LanSyncService.localIpv4Addresses(),
                 isRunning = true,
             )
@@ -46,17 +51,20 @@ class SyncCoordinator(
     fun snapshot(): AppState = state
 
     fun sendCurrentClipboard() {
-        val text = clipboard.readText().orEmpty()
-        if (text.isBlank()) {
-            update { it.copy(errorMessage = "当前剪贴板没有文本") }
-            return
+        update { it.copy(statusMessage = "正在读取并同步剪贴板…", errorMessage = null) }
+        clipboardExecutor.execute {
+            val content = clipboard.readContent()
+            if (content == null || content.isEmpty()) {
+                update { it.copy(errorMessage = "当前剪贴板没有可同步的文本、富文本、图片或文件") }
+            } else {
+                send(content)
+            }
         }
-        send(text)
     }
 
-    fun copyToClipboard(text: String) {
-        clipboard.writeText(text)
-        update { it.copy(currentClipboard = text, statusMessage = "已复制到本机剪贴板") }
+    fun copyToClipboard(content: ClipboardContent) {
+        clipboard.writeContent(content)
+        update { it.copy(currentClipboard = content, statusMessage = "已复制到本机剪贴板") }
     }
 
     fun deleteHistory(id: String) = update { current ->
@@ -68,6 +76,7 @@ class SyncCoordinator(
     fun setAutoSend(enabled: Boolean) {
         settings.put(KEY_AUTO_SEND, enabled.toString())
         update { it.copy(autoSend = enabled) }
+        if (enabled && state.peers.isNotEmpty()) syncCurrentAfterConnection()
     }
 
     fun setAutoReceive(enabled: Boolean) {
@@ -107,11 +116,18 @@ class SyncCoordinator(
 
     private fun restartService() {
         service?.close()
+        lastPeerIds = emptySet()
         val current = state
         service = LanSyncService(
             config = LanSyncService.Config(deviceId, current.deviceName, deviceKind, current.pairingCode),
             listener = object : LanSyncService.Listener {
-                override fun onPeersChanged(peers: List<PeerDevice>) = update { it.copy(peers = peers) }
+                override fun onPeersChanged(peers: List<PeerDevice>) {
+                    val peerIds = peers.mapTo(mutableSetOf()) { it.id }
+                    val hasNewPeer = peerIds.any { it !in lastPeerIds }
+                    lastPeerIds = peerIds
+                    update { it.copy(peers = peers) }
+                    if (hasNewPeer && state.autoSend) syncCurrentAfterConnection()
+                }
                 override fun onStatus(message: String) = update { it.copy(statusMessage = message, errorMessage = null) }
                 override fun onError(message: String) = update { it.copy(errorMessage = message) }
                 override fun onMessage(message: ClipMessage) = onRemoteMessage(message)
@@ -119,38 +135,52 @@ class SyncCoordinator(
         ).also { it.start() }
     }
 
-    private fun onLocalClipboardChanged(text: String) {
-        if (text.isBlank()) return
-        update { it.copy(currentClipboard = text) }
-        if (state.autoSend) send(text)
+    private fun syncCurrentAfterConnection() {
+        clipboardExecutor.execute {
+            val content = clipboard.readContent()?.takeUnless { it.isEmpty() } ?: return@execute
+            send(content, statusWhenSent = "连接成功，已自动同步当前剪贴板")
+        }
     }
 
-    private fun send(text: String) {
-        val recipients = service?.broadcastText(text) ?: 0
-        val item = ClipItem(UUID.randomUUID().toString(), text, ClipDirection.SENT, "${recipients} 台设备", System.currentTimeMillis())
+    private fun onLocalClipboardChanged(content: ClipboardContent) {
+        if (content.isEmpty()) return
+        update { it.copy(currentClipboard = content) }
+        if (state.autoSend) clipboardExecutor.execute { send(content) }
+    }
+
+    private fun send(content: ClipboardContent, statusWhenSent: String? = null) {
+        val recipients = service?.broadcast(content) ?: 0
+        val item = ClipItem(UUID.randomUUID().toString(), content, ClipDirection.SENT, "${recipients} 台设备", System.currentTimeMillis())
         update { current ->
             current.copy(
-                currentClipboard = text,
-                history = (listOf(item) + current.history).take(MAX_HISTORY),
-                statusMessage = if (recipients == 0) "已排队，设备连接后自动发送" else "已发送到 $recipients 台设备",
+                currentClipboard = content,
+                history = trimHistory(listOf(item) + current.history),
+                statusMessage = if (recipients == 0) "已排队，设备连接后自动发送" else statusWhenSent ?: "已发送到 $recipients 台设备",
                 errorMessage = null,
             )
         }
     }
 
     private fun onRemoteMessage(message: ClipMessage) {
-        val item = ClipItem(message.id, message.text, ClipDirection.RECEIVED, message.originDeviceName, message.timestamp)
+        val content = message.content ?: return
+        val item = ClipItem(message.id, content, ClipDirection.RECEIVED, message.originDeviceName, message.timestamp)
         val shouldApply = state.autoReceive
-        if (shouldApply) {
-            clipboard.writeText(message.text)
-        }
+        if (shouldApply) clipboard.writeContent(content)
         update { current ->
             current.copy(
-                currentClipboard = if (shouldApply) message.text else current.currentClipboard,
-                history = (listOf(item) + current.history).distinctBy { it.id }.take(MAX_HISTORY),
-                statusMessage = if (shouldApply) "已接收 ${message.originDeviceName} 的剪贴板" else "收到一条剪贴板（自动接收已关闭）",
+                currentClipboard = if (shouldApply) content else current.currentClipboard,
+                history = trimHistory((listOf(item) + current.history).distinctBy { it.id }),
+                statusMessage = if (shouldApply) "已接收 ${message.originDeviceName} 的${kindName(content.kind)}" else "收到剪贴板内容（自动接收已关闭）",
                 errorMessage = null,
             )
+        }
+    }
+
+    private fun trimHistory(items: List<ClipItem>): List<ClipItem> {
+        var bytes = 0L
+        return items.take(MAX_HISTORY).takeWhile {
+            bytes += it.content.sizeBytes
+            bytes <= MAX_HISTORY_BYTES
         }
     }
 
@@ -162,18 +192,28 @@ class SyncCoordinator(
 
     override fun close() {
         clipboard.stopWatching()
+        clipboardExecutor.shutdownNow()
         service?.close()
         service = null
+        lastPeerIds = emptySet()
         update { it.copy(isRunning = false, peers = emptyList(), statusMessage = "已停止") }
     }
 
     companion object {
-        private const val MAX_HISTORY = 50
+        private const val MAX_HISTORY = 30
+        private const val MAX_HISTORY_BYTES = 64L * 1024 * 1024
         private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_DEVICE_NAME = "device_name"
         private const val KEY_PAIRING_CODE = "pairing_code"
         private const val KEY_AUTO_SEND = "auto_send"
         private const val KEY_AUTO_RECEIVE = "auto_receive"
+
+        private fun kindName(kind: ClipboardKind) = when (kind) {
+            ClipboardKind.TEXT -> "文本"
+            ClipboardKind.HTML -> "富文本"
+            ClipboardKind.IMAGE -> "图片"
+            ClipboardKind.FILES -> "文件"
+        }
 
         private fun generatePairingCode(): String {
             val random = SecureRandom()
