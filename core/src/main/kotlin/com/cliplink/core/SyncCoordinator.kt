@@ -11,6 +11,7 @@ class SyncCoordinator(
     defaultDeviceName: String,
     private val deviceKind: DeviceKind,
     supportsBackgroundMode: Boolean = false,
+    defaultKeepAlive: Boolean = false,
     private val onKeepAliveChanged: (Boolean) -> Unit = {},
 ) : AutoCloseable {
     private val observers = CopyOnWriteArrayList<(AppState) -> Unit>()
@@ -30,7 +31,7 @@ class SyncCoordinator(
         pairingCode = storedPairingCode,
         autoSend = settings.get(KEY_AUTO_SEND)?.toBooleanStrictOrNull() ?: true,
         autoReceive = settings.get(KEY_AUTO_RECEIVE)?.toBooleanStrictOrNull() ?: true,
-        keepAlive = settings.get(KEY_KEEP_ALIVE)?.toBooleanStrictOrNull() ?: false,
+        keepAlive = settings.get(KEY_KEEP_ALIVE)?.toBooleanStrictOrNull() ?: defaultKeepAlive,
         supportsBackgroundMode = supportsBackgroundMode,
         manualTarget = settings.get(KEY_MANUAL_TARGET).orEmpty(),
     )

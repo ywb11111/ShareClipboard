@@ -1,5 +1,8 @@
 package com.example.myapptoshare
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -7,22 +10,31 @@ import android.content.Intent
 import android.content.ComponentName
 import android.content.ServiceConnection
 import android.content.pm.ServiceInfo
+import android.content.pm.PackageManager
 import android.app.Service
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.IBinder
 import android.os.Binder
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,10 +42,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Button
+import androidx.compose.material3.Text
+import androidx.compose.material3.MaterialTheme
 import androidx.core.content.edit
 import androidx.core.content.FileProvider
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import android.provider.OpenableColumns
@@ -53,7 +71,16 @@ import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
     private val coordinatorState = mutableStateOf<SyncCoordinator?>(null)
+    private val localNetworkDenied = mutableStateOf(false)
     private var serviceBound = false
+    private val localNetworkPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        localNetworkDenied.value = !granted
+        if (granted) {
+            requestNotificationPermissionIfNeeded()
+            connectService()
+        }
+    }
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             coordinatorState.value = (binder as ClipLinkService.LocalBinder).coordinator
@@ -72,7 +99,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             ClipLinkTheme {
                 val coordinator = coordinatorState.value
-                if (coordinator == null) {
+                if (localNetworkDenied.value) {
+                    LocalNetworkPermissionRequired { requestLocalNetworkPermission() }
+                } else if (coordinator == null) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 } else {
                     CoordinatorScreen(coordinator)
@@ -83,8 +112,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (Build.VERSION.SDK_INT >= 37 && ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_LOCAL_NETWORK,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestLocalNetworkPermission()
+        } else {
+            localNetworkDenied.value = false
+            requestNotificationPermissionIfNeeded()
+            connectService()
+        }
+    }
+
+    private fun connectService() {
+        if (serviceBound) return
         val intent = Intent(this, ClipLinkService::class.java)
-        val keepAlive = AndroidSettingsStore(this).get("keep_alive")?.toBooleanStrictOrNull() == true
+        val keepAlive = AndroidSettingsStore(this).get("keep_alive")?.toBooleanStrictOrNull() ?: true
         if (keepAlive) {
             ContextCompat.startForegroundService(this, intent)
         } else {
@@ -93,15 +137,44 @@ class MainActivity : ComponentActivity() {
         serviceBound = bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
+    private fun requestLocalNetworkPermission() {
+        if (Build.VERSION.SDK_INT >= 37) localNetworkPermission.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        val keepAlive = AndroidSettingsStore(this).get("keep_alive")?.toBooleanStrictOrNull() ?: true
+        if (!keepAlive) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     override fun onStop() {
         if (serviceBound) {
             unbindService(serviceConnection)
             serviceBound = false
         }
         coordinatorState.value = null
-        val keepAlive = AndroidSettingsStore(this).get("keep_alive")?.toBooleanStrictOrNull() == true
+        val keepAlive = AndroidSettingsStore(this).get("keep_alive")?.toBooleanStrictOrNull() ?: true
         if (!keepAlive && !isChangingConfigurations) stopService(Intent(this, ClipLinkService::class.java))
         super.onStop()
+    }
+}
+
+@androidx.compose.runtime.Composable
+private fun LocalNetworkPermissionRequired(onRequest: () -> Unit) {
+    Box(Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("需要局域网权限", style = MaterialTheme.typography.headlineSmall)
+            Spacer(Modifier.height(10.dp))
+            Text("ClipLink 需要访问本地网络，才能发现并连接你的电脑。")
+            Spacer(Modifier.height(18.dp))
+            Button(onClick = onRequest) { Text("授予权限") }
+        }
     }
 }
 
@@ -109,6 +182,7 @@ class MainActivity : ComponentActivity() {
 private fun CoordinatorScreen(coordinator: SyncCoordinator) {
     var state by remember(coordinator) { mutableStateOf(coordinator.snapshot()) }
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val context = LocalContext.current
     DisposableEffect(coordinator) {
         val subscription = coordinator.observe { next ->
             if (Looper.myLooper() == Looper.getMainLooper()) state = next else mainHandler.post { state = next }
@@ -117,7 +191,13 @@ private fun CoordinatorScreen(coordinator: SyncCoordinator) {
     }
     ClipLinkScreen(
         state = state,
-        actions = coordinator.actions(),
+        actions = coordinator.actions {
+            val batterySettings = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            val appSettings = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:${context.packageName}".toUri())
+            if (runCatching { context.startActivity(batterySettings) }.isFailure) {
+                context.startActivity(appSettings)
+            }
+        },
         modifier = Modifier.safeDrawingPadding(),
     )
 }
@@ -129,6 +209,9 @@ class ClipLinkService : Service() {
 
     private val binder = LocalBinder()
     private lateinit var coordinator: SyncCoordinator
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -138,6 +221,7 @@ class ClipLinkService : Service() {
             defaultDeviceName = buildDeviceName(),
             deviceKind = DeviceKind.PHONE,
             supportsBackgroundMode = true,
+            defaultKeepAlive = true,
             onKeepAliveChanged = ::setBackgroundMode,
         ).also { it.start() }
         if (coordinator.snapshot().keepAlive) enterForeground()
@@ -146,11 +230,16 @@ class ClipLinkService : Service() {
     override fun onBind(intent: Intent): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            coordinator.setKeepAlive(false)
+            return START_NOT_STICKY
+        }
         if (coordinator.snapshot().keepAlive) enterForeground()
         return if (coordinator.snapshot().keepAlive) START_STICKY else START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        releaseConnectionLocks()
         coordinator.close()
         super.onDestroy()
     }
@@ -165,6 +254,7 @@ class ClipLinkService : Service() {
             startService(Intent(this, ClipLinkService::class.java))
             enterForeground()
         } else {
+            releaseConnectionLocks()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -181,6 +271,25 @@ class ClipLinkService : Service() {
             .setContentText("局域网剪贴板接收与设备心跳正在运行")
             .setOngoing(true)
             .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this,
+                    0,
+                    Intent(this, MainActivity::class.java),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                ),
+            )
+            .addAction(
+                0,
+                "停止后台连接",
+                PendingIntent.getService(
+                    this,
+                    1,
+                    Intent(this, ClipLinkService::class.java).setAction(ACTION_STOP),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                ),
+            )
             .build()
         ServiceCompat.startForeground(
             this,
@@ -188,11 +297,47 @@ class ClipLinkService : Service() {
             notification,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0,
         )
+        acquireConnectionLocks()
+    }
+
+    @SuppressLint("WakelockTimeout")
+    @Suppress("DEPRECATION")
+    private fun acquireConnectionLocks() {
+        if (wakeLock?.isHeld != true) {
+            wakeLock = runCatching {
+                getSystemService(PowerManager::class.java)
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ClipLink:Connection")
+                    .apply { setReferenceCounted(false); acquire() }
+            }.getOrNull()
+        }
+        val wifi = applicationContext.getSystemService(WifiManager::class.java)
+        if (wifiLock?.isHeld != true) {
+            wifiLock = runCatching {
+                wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ClipLink:Wifi")
+                    .apply { setReferenceCounted(false); acquire() }
+            }.getOrNull()
+        }
+        if (multicastLock?.isHeld != true) {
+            multicastLock = runCatching {
+                wifi.createMulticastLock("ClipLink:Discovery")
+                    .apply { setReferenceCounted(false); acquire() }
+            }.getOrNull()
+        }
+    }
+
+    private fun releaseConnectionLocks() {
+        runCatching { if (multicastLock?.isHeld == true) multicastLock?.release() }
+        runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
+        runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+        multicastLock = null
+        wifiLock = null
+        wakeLock = null
     }
 
     companion object {
         private const val NOTIFICATION_CHANNEL = "cliplink_connection"
         private const val NOTIFICATION_ID = 24816
+        private const val ACTION_STOP = "com.cliplink.action.STOP_BACKGROUND"
     }
 }
 
@@ -201,7 +346,7 @@ private fun buildDeviceName(): String {
     return "$maker ${Build.MODEL}".take(32)
 }
 
-private fun SyncCoordinator.actions() = ClipLinkActions(
+private fun SyncCoordinator.actions(openBatterySettings: () -> Unit) = ClipLinkActions(
     sendCurrent = ::sendCurrentClipboard,
     copy = ::copyToClipboard,
     deleteHistory = ::deleteHistory,
@@ -209,6 +354,7 @@ private fun SyncCoordinator.actions() = ClipLinkActions(
     setAutoSend = ::setAutoSend,
     setAutoReceive = ::setAutoReceive,
     setKeepAlive = ::setKeepAlive,
+    openBatterySettings = openBatterySettings,
     updateIdentity = ::updateIdentity,
     connectManually = ::connectManually,
     dismissError = ::dismissError,

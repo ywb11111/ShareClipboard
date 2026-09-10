@@ -86,6 +86,7 @@ data class ClipLinkActions(
     val setAutoSend: (Boolean) -> Unit,
     val setAutoReceive: (Boolean) -> Unit,
     val setKeepAlive: (Boolean) -> Unit,
+    val openBatterySettings: () -> Unit,
     val updateIdentity: (String, String) -> Boolean,
     val connectManually: (String) -> Boolean,
     val dismissError: () -> Unit,
@@ -375,6 +376,16 @@ private fun SettingsPage(state: AppState, actions: ClipLinkActions) {
                 if (state.supportsBackgroundMode) {
                     HorizontalDivider()
                     ToggleRow("后台保持连接", "显示常驻通知，界面关闭后仍保持网络连接", state.keepAlive, actions.setKeepAlive)
+                    Text(
+                        "长期运行会增加耗电。若锁屏后仍断开，请在系统设置中将 ClipLink 设为“不优化”或“不受限制”。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = actions.openBatterySettings,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("打开系统电池优化设置") }
                 }
             }
         }

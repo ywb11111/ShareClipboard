@@ -124,6 +124,7 @@ private fun SyncCoordinator.actions() = ClipLinkActions(
     setAutoSend = ::setAutoSend,
     setAutoReceive = ::setAutoReceive,
     setKeepAlive = ::setKeepAlive,
+    openBatterySettings = {},
     updateIdentity = ::updateIdentity,
     connectManually = ::connectManually,
     dismissError = ::dismissError,
