@@ -3,23 +3,39 @@ package com.example.myapptoshare
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.ComponentName
+import android.content.ServiceConnection
+import android.content.pm.ServiceInfo
+import android.app.Service
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.IBinder
+import android.os.Binder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.core.content.edit
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import android.provider.OpenableColumns
 import com.cliplink.core.ClipboardPort
 import com.cliplink.core.ClipboardContent
@@ -36,34 +52,102 @@ import java.io.File
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
-    private lateinit var coordinator: SyncCoordinator
+    private val coordinatorState = mutableStateOf<SyncCoordinator?>(null)
+    private var serviceBound = false
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            coordinatorState.value = (binder as ClipLinkService.LocalBinder).coordinator
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            coordinatorState.value = null
+            serviceBound = false
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        setContent {
+            ClipLinkTheme {
+                val coordinator = coordinatorState.value
+                if (coordinator == null) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                } else {
+                    CoordinatorScreen(coordinator)
+                }
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val intent = Intent(this, ClipLinkService::class.java)
+        val keepAlive = AndroidSettingsStore(this).get("keep_alive")?.toBooleanStrictOrNull() == true
+        if (keepAlive) {
+            ContextCompat.startForegroundService(this, intent)
+        } else {
+            startService(intent)
+        }
+        serviceBound = bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    override fun onStop() {
+        if (serviceBound) {
+            unbindService(serviceConnection)
+            serviceBound = false
+        }
+        coordinatorState.value = null
+        val keepAlive = AndroidSettingsStore(this).get("keep_alive")?.toBooleanStrictOrNull() == true
+        if (!keepAlive && !isChangingConfigurations) stopService(Intent(this, ClipLinkService::class.java))
+        super.onStop()
+    }
+}
+
+@androidx.compose.runtime.Composable
+private fun CoordinatorScreen(coordinator: SyncCoordinator) {
+    var state by remember(coordinator) { mutableStateOf(coordinator.snapshot()) }
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    DisposableEffect(coordinator) {
+        val subscription = coordinator.observe { next ->
+            if (Looper.myLooper() == Looper.getMainLooper()) state = next else mainHandler.post { state = next }
+        }
+        onDispose { subscription.close() }
+    }
+    ClipLinkScreen(
+        state = state,
+        actions = coordinator.actions(),
+        modifier = Modifier.safeDrawingPadding(),
+    )
+}
+
+class ClipLinkService : Service() {
+    inner class LocalBinder : Binder() {
+        val coordinator: SyncCoordinator get() = this@ClipLinkService.coordinator
+    }
+
+    private val binder = LocalBinder()
+    private lateinit var coordinator: SyncCoordinator
+
+    override fun onCreate() {
+        super.onCreate()
         coordinator = SyncCoordinator(
             clipboard = AndroidClipboardPort(this),
             settings = AndroidSettingsStore(this),
             defaultDeviceName = buildDeviceName(),
             deviceKind = DeviceKind.PHONE,
+            supportsBackgroundMode = true,
+            onKeepAliveChanged = ::setBackgroundMode,
         ).also { it.start() }
+        if (coordinator.snapshot().keepAlive) enterForeground()
+    }
 
-        setContent {
-            var state by remember { mutableStateOf(coordinator.snapshot()) }
-            DisposableEffect(coordinator) {
-                val subscription = coordinator.observe { next -> runOnUiThread { state = next } }
-                onDispose { subscription.close() }
-            }
+    override fun onBind(intent: Intent): IBinder = binder
 
-            ClipLinkTheme {
-                ClipLinkScreen(
-                    state = state,
-                    actions = coordinator.actions(),
-                    modifier = Modifier.safeDrawingPadding(),
-                )
-            }
-        }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (coordinator.snapshot().keepAlive) enterForeground()
+        return if (coordinator.snapshot().keepAlive) START_STICKY else START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -71,10 +155,50 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    private fun buildDeviceName(): String {
-        val maker = Build.MANUFACTURER.replaceFirstChar { it.uppercase() }
-        return "$maker ${Build.MODEL}".take(32)
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (!coordinator.snapshot().keepAlive) stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
+
+    private fun setBackgroundMode(enabled: Boolean) {
+        if (enabled) {
+            startService(Intent(this, ClipLinkService::class.java))
+            enterForeground()
+        } else {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun enterForeground() {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(NOTIFICATION_CHANNEL, "ClipLink 后台连接", NotificationManager.IMPORTANCE_LOW),
+        )
+        val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("ClipLink 正在保持连接")
+            .setContentText("局域网剪贴板接收与设备心跳正在运行")
+            .setOngoing(true)
+            .setSilent(true)
+            .build()
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            notification,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0,
+        )
+    }
+
+    companion object {
+        private const val NOTIFICATION_CHANNEL = "cliplink_connection"
+        private const val NOTIFICATION_ID = 24816
+    }
+}
+
+private fun buildDeviceName(): String {
+    val maker = Build.MANUFACTURER.replaceFirstChar { it.uppercase() }
+    return "$maker ${Build.MODEL}".take(32)
 }
 
 private fun SyncCoordinator.actions() = ClipLinkActions(
@@ -84,6 +208,7 @@ private fun SyncCoordinator.actions() = ClipLinkActions(
     clearHistory = ::clearHistory,
     setAutoSend = ::setAutoSend,
     setAutoReceive = ::setAutoReceive,
+    setKeepAlive = ::setKeepAlive,
     updateIdentity = ::updateIdentity,
     connectManually = ::connectManually,
     dismissError = ::dismissError,

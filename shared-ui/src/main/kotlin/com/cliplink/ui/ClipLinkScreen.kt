@@ -85,6 +85,7 @@ data class ClipLinkActions(
     val clearHistory: () -> Unit,
     val setAutoSend: (Boolean) -> Unit,
     val setAutoReceive: (Boolean) -> Unit,
+    val setKeepAlive: (Boolean) -> Unit,
     val updateIdentity: (String, String) -> Boolean,
     val connectManually: (String) -> Boolean,
     val dismissError: () -> Unit,
@@ -256,6 +257,12 @@ private fun ConnectionSummary(state: AppState) {
             color = MaterialTheme.colorScheme.primary,
         )
     }
+    Spacer(Modifier.height(6.dp))
+    Text(
+        state.transportDetail,
+        style = MaterialTheme.typography.labelSmall,
+        color = if (state.tcpListening) Color(0xFF167A55) else MaterialTheme.colorScheme.error,
+    )
 }
 
 @Composable
@@ -293,7 +300,12 @@ private fun DeviceRow(device: PeerDevice) {
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
                 Text(device.name, fontWeight = FontWeight.SemiBold)
-                Text(device.address, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val secondsAgo = ((System.currentTimeMillis() - device.lastSeenAt) / 1_000).coerceAtLeast(0)
+                Text(
+                    "${device.address} · 心跳 ${secondsAgo} 秒前",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             Icon(Icons.Rounded.CheckCircle, "已连接", tint = Color(0xFF19A66F))
         }
@@ -349,7 +361,7 @@ private fun HistoryRow(item: ClipItem, actions: ClipLinkActions) {
 private fun SettingsPage(state: AppState, actions: ClipLinkActions) {
     var name by remember(state.deviceName) { mutableStateOf(state.deviceName) }
     var code by remember(state.pairingCode) { mutableStateOf(state.pairingCode) }
-    var manualTarget by remember { mutableStateOf("") }
+    var manualTarget by remember(state.manualTarget) { mutableStateOf(state.manualTarget) }
     LazyColumn(
         Modifier.fillMaxSize().padding(horizontal = 24.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -360,6 +372,10 @@ private fun SettingsPage(state: AppState, actions: ClipLinkActions) {
                 ToggleRow("自动发送", "连接后补发当前内容，之后有变化即自动发送", state.autoSend, actions.setAutoSend)
                 HorizontalDivider()
                 ToggleRow("自动接收", "收到内容后写入本机剪贴板", state.autoReceive, actions.setAutoReceive)
+                if (state.supportsBackgroundMode) {
+                    HorizontalDivider()
+                    ToggleRow("后台保持连接", "显示常驻通知，界面关闭后仍保持网络连接", state.keepAlive, actions.setKeepAlive)
+                }
             }
         }
         item { SectionTitle("手动连接", "广播发现失败时，输入对方设备显示的 IPv4") }
@@ -421,7 +437,7 @@ private fun SettingsPage(state: AppState, actions: ClipLinkActions) {
                     Text("Android 提示", fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "支持文本、富文本、图片及文件（最多 32 个、合计 32 MB）。Android 10 及以上会限制后台读取剪贴板；手机端在前台时可自动同步，不在前台时请打开 ClipLink。",
+                        "支持文本、富文本、图片及文件（最多 32 个、合计 32 MB）。开启“后台保持连接”可在关闭界面后维持心跳和接收；Android 10 及以上仍限制后台读取本机剪贴板。",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }

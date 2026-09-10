@@ -10,6 +10,8 @@ class SyncCoordinator(
     private val settings: SettingsStore,
     defaultDeviceName: String,
     private val deviceKind: DeviceKind,
+    supportsBackgroundMode: Boolean = false,
+    private val onKeepAliveChanged: (Boolean) -> Unit = {},
 ) : AutoCloseable {
     private val observers = CopyOnWriteArrayList<(AppState) -> Unit>()
     private val clipboardExecutor = Executors.newSingleThreadExecutor { task ->
@@ -28,6 +30,9 @@ class SyncCoordinator(
         pairingCode = storedPairingCode,
         autoSend = settings.get(KEY_AUTO_SEND)?.toBooleanStrictOrNull() ?: true,
         autoReceive = settings.get(KEY_AUTO_RECEIVE)?.toBooleanStrictOrNull() ?: true,
+        keepAlive = settings.get(KEY_KEEP_ALIVE)?.toBooleanStrictOrNull() ?: false,
+        supportsBackgroundMode = supportsBackgroundMode,
+        manualTarget = settings.get(KEY_MANUAL_TARGET).orEmpty(),
     )
 
     fun start() {
@@ -84,6 +89,12 @@ class SyncCoordinator(
         update { it.copy(autoReceive = enabled) }
     }
 
+    fun setKeepAlive(enabled: Boolean) {
+        settings.put(KEY_KEEP_ALIVE, enabled.toString())
+        update { it.copy(keepAlive = enabled) }
+        onKeepAliveChanged(enabled)
+    }
+
     fun updateIdentity(deviceName: String, pairingCode: String): Boolean {
         val cleanName = deviceName.trim().take(32)
         val cleanCode = pairingCode.trim().uppercase()
@@ -110,7 +121,10 @@ class SyncCoordinator(
             return false
         }
         val accepted = service?.addManualPeer(target) == true
-        if (!accepted) update { it.copy(errorMessage = "IPv4 地址格式不正确，可使用 172.23.2.80 或 172.23.2.80:24816") }
+        if (accepted) {
+            settings.put(KEY_MANUAL_TARGET, target.trim())
+            update { it.copy(manualTarget = target.trim(), errorMessage = null) }
+        } else update { it.copy(errorMessage = "IPv4 地址格式不正确，可使用 172.23.2.80 或 172.23.2.80:24816") }
         return accepted
     }
 
@@ -131,8 +145,14 @@ class SyncCoordinator(
                 override fun onStatus(message: String) = update { it.copy(statusMessage = message, errorMessage = null) }
                 override fun onError(message: String) = update { it.copy(errorMessage = message) }
                 override fun onMessage(message: ClipMessage) = onRemoteMessage(message)
+                override fun onTransportState(listening: Boolean, detail: String) = update {
+                    it.copy(tcpListening = listening, transportDetail = detail)
+                }
             },
-        ).also { it.start() }
+        ).also { newService ->
+            newService.start()
+            current.manualTarget.takeIf { it.isNotBlank() }?.let(newService::addManualPeer)
+        }
     }
 
     private fun syncCurrentAfterConnection() {
@@ -207,6 +227,8 @@ class SyncCoordinator(
         private const val KEY_PAIRING_CODE = "pairing_code"
         private const val KEY_AUTO_SEND = "auto_send"
         private const val KEY_AUTO_RECEIVE = "auto_receive"
+        private const val KEY_KEEP_ALIVE = "keep_alive"
+        private const val KEY_MANUAL_TARGET = "manual_target"
 
         private fun kindName(kind: ClipboardKind) = when (kind) {
             ClipboardKind.TEXT -> "文本"

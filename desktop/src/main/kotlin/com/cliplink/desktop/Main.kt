@@ -29,45 +29,90 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.InetAddress
 import java.nio.file.Files
+import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
+import java.nio.file.StandardOpenOption
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.prefs.Preferences
 import javax.swing.SwingUtilities
+import javax.swing.JOptionPane
 import javax.imageio.ImageIO
 
-fun main() = application {
-    val coordinator = remember {
-        SyncCoordinator(
-            clipboard = DesktopClipboardPort(),
-            settings = DesktopSettingsStore(),
-            defaultDeviceName = runCatching { InetAddress.getLocalHost().hostName }.getOrDefault("我的电脑").take(32),
-            deviceKind = DeviceKind.DESKTOP,
-        ).also { it.start() }
+fun main() {
+    val instanceGuard = SingleInstanceGuard.acquire()
+    if (instanceGuard == null) {
+        JOptionPane.showMessageDialog(null, "ClipLink 已经在运行。", "ClipLink", JOptionPane.INFORMATION_MESSAGE)
+        return
     }
-    var state by remember { mutableStateOf(coordinator.snapshot()) }
+    try {
+        application {
+            val coordinator = remember {
+                SyncCoordinator(
+                    clipboard = DesktopClipboardPort(),
+                    settings = DesktopSettingsStore(),
+                    defaultDeviceName = runCatching { InetAddress.getLocalHost().hostName }.getOrDefault("我的电脑").take(32),
+                    deviceKind = DeviceKind.DESKTOP,
+                ).also { it.start() }
+            }
+            var state by remember { mutableStateOf(coordinator.snapshot()) }
 
-    DisposableEffect(coordinator) {
-        val subscription = coordinator.observe { next ->
-            if (SwingUtilities.isEventDispatchThread()) state = next
-            else SwingUtilities.invokeLater { state = next }
+            DisposableEffect(coordinator) {
+                val subscription = coordinator.observe { next ->
+                    if (SwingUtilities.isEventDispatchThread()) state = next
+                    else SwingUtilities.invokeLater { state = next }
+                }
+                onDispose {
+                    subscription.close()
+                    coordinator.close()
+                }
+            }
+
+            Window(
+                onCloseRequest = {
+                    coordinator.close()
+                    exitApplication()
+                },
+                title = "ClipLink",
+                resizable = true,
+            ) {
+                window.minimumSize = java.awt.Dimension(520, 620)
+                ClipLinkTheme { ClipLinkScreen(state, coordinator.actions()) }
+            }
         }
-        onDispose {
-            subscription.close()
-            coordinator.close()
-        }
+    } finally {
+        instanceGuard.close()
+    }
+}
+
+private class SingleInstanceGuard private constructor(
+    private val channel: FileChannel,
+    private val lock: FileLock,
+) : AutoCloseable {
+    override fun close() {
+        runCatching { lock.release() }
+        runCatching { channel.close() }
     }
 
-    Window(
-        onCloseRequest = {
-            coordinator.close()
-            exitApplication()
-        },
-        title = "ClipLink",
-        resizable = true,
-    ) {
-        window.minimumSize = java.awt.Dimension(520, 620)
-        ClipLinkTheme { ClipLinkScreen(state, coordinator.actions()) }
+    companion object {
+        fun acquire(): SingleInstanceGuard? {
+            val directory = File(System.getenv("LOCALAPPDATA") ?: System.getProperty("user.home"), "ClipLink")
+            directory.mkdirs()
+            val channel = runCatching {
+                FileChannel.open(
+                    File(directory, "cliplink.lock").toPath(),
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,
+                )
+            }.getOrNull() ?: return null
+            val lock = runCatching { channel.tryLock() }.getOrNull()
+            if (lock == null) {
+                channel.close()
+                return null
+            }
+            return SingleInstanceGuard(channel, lock)
+        }
     }
 }
 
@@ -78,6 +123,7 @@ private fun SyncCoordinator.actions() = ClipLinkActions(
     clearHistory = ::clearHistory,
     setAutoSend = ::setAutoSend,
     setAutoReceive = ::setAutoReceive,
+    setKeepAlive = ::setKeepAlive,
     updateIdentity = ::updateIdentity,
     connectManually = ::connectManually,
     dismissError = ::dismissError,
